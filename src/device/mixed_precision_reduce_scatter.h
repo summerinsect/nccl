@@ -17,12 +17,41 @@
 namespace {
 
 template <typename RedOp>
-__device__ __forceinline__ void mixedReduceCopyScalar(int tid, int nworkers, void* src0, void* src1, void* dst,
-                                                      int nelem, bool hasPeerSrc) {
+__device__ __forceinline__ void mixedReduceCopy(int tid, int nworkers, void* src0, void* src1, void* dst, int nelem,
+                                                bool hasPeerSrc) {
+  constexpr int EltPerPack = 8;
   __nv_bfloat16 const* local = static_cast<__nv_bfloat16 const*>(src0);
   float const* peer = static_cast<float const*>(src1);
   float* out = static_cast<float*>(dst);
-  for (int i = tid; i < nelem; i += nworkers) {
+
+  uintptr_t localAddr = cvta_to_global(local);
+  uintptr_t peerAddr = hasPeerSrc ? cvta_to_global(peer) : 0;
+  uintptr_t outAddr = cvta_to_global(out);
+  bool aligned = ((localAddr | peerAddr | outAddr) & 0xf) == 0;
+  int packedElem = aligned ? nelem / EltPerPack * EltPerPack : 0;
+
+  for (int i = tid * EltPerPack; i < packedElem; i += nworkers * EltPerPack) {
+    BytePack<16> localPack = ld_volatile_global<16>(localAddr + i * sizeof(__nv_bfloat16));
+    BytePack<16> acc[2];
+
+    NVCC_PRAGMA_UNROLL(EltPerPack)
+    for (int j = 0; j < EltPerPack; j++) acc[j / 4].u32[j % 4] = uint32_t(localPack.u16[j]) << 16;
+
+    if (hasPeerSrc) {
+      BytePack<16> peerPack[2] = {ld_volatile_global<16>(peerAddr + i * sizeof(float)),
+                                  ld_volatile_global<16>(peerAddr + (i + 4) * sizeof(float))};
+      NVCC_PRAGMA_UNROLL(EltPerPack)
+      for (int j = 0; j < EltPerPack; j++) {
+        float sum = __uint_as_float(acc[j / 4].u32[j % 4]) + __uint_as_float(peerPack[j / 4].u32[j % 4]);
+        acc[j / 4].u32[j % 4] = __float_as_uint(sum);
+      }
+    }
+
+    st_global<16>(outAddr + i * sizeof(float), acc[0]);
+    st_global<16>(outAddr + (i + 4) * sizeof(float), acc[1]);
+  }
+
+  for (int i = packedElem + tid; i < nelem; i += nworkers) {
     float acc = __bfloat162float(local[i]);
     if (hasPeerSrc) acc += ((volatile float const*)peer)[i];
     out[i] = acc;
@@ -99,8 +128,8 @@ class MixedPrecisionReduceScatterPrims {
 
         int workSize = ncclShmem.aborted ? 0 : sliceSize;
         if (workSize > 0) {
-          mixedReduceCopyScalar<RedOp>(tid, nworkers, ncclShmem.groups[0].srcs[0], ncclShmem.groups[0].srcs[1],
-                                       ncclShmem.groups[0].dsts[0], workSize, Recv != 0);
+          mixedReduceCopy<RedOp>(tid, nworkers, ncclShmem.groups[0].srcs[0], ncclShmem.groups[0].srcs[1],
+                                 ncclShmem.groups[0].dsts[0], workSize, Recv != 0);
         }
 
         barrier();

@@ -833,6 +833,26 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
            task->count * ncclTypeSize(task->datatype), ncclAlgoToString(task->algorithm),
            ncclProtoToString(task->protocol), devWork->channelLo, devWork->channelHi);
 
+      if (task->func == ncclFuncReduceScatter || task->func == ncclFuncMixedPrecisionReduceScatter) {
+        ncclDataType_t inputType = task->func == ncclFuncMixedPrecisionReduceScatter ? task->inputtype : task->datatype;
+        size_t inputBytes = task->count * comm->nRanks * ncclTypeSize(inputType);
+        size_t internalBytes = task->count * comm->nRanks * ncclTypeSize(task->datatype);
+        INFO(NCCL_TUNING,
+             "[MIXED-RS-OBSERVE] func=%s recvcount=%zu inputType=%s internalType=%s inputBytes=%zu "
+             "internalBytes=%zu trafficBytes=%zu algo=%s proto=%s commChannels=%d tunedMaxChannels=%d "
+             "actualChannels=%d channelRange=%d..%d taskThreads=%d launchThreads=%d chunkSteps=%d sliceSteps=%d "
+             "count{Lo,Mid,Hi}={%zu,%zu,%zu} chunkBytes{Lo,Mid,Hi}={%d,%d,%d}",
+             ncclFuncToString(task->func), task->count, ncclDatatypeToString(inputType),
+             ncclDatatypeToString(task->datatype), inputBytes, internalBytes, task->trafficBytes,
+             ncclAlgoToString(task->algorithm), ncclProtoToString(task->protocol), comm->nChannels,
+             task->nMaxChannels, devWork->channelHi - devWork->channelLo + 1, devWork->channelLo,
+             devWork->channelHi, task->nWarps * WARP_SIZE, plan->threadPerBlock, task->chunkSteps, task->sliceSteps,
+             devWork->cbd.countLo, devWork->cbd.countMid, devWork->cbd.countHi,
+             devWork->cbd.chunkGrainsLo * ncclProtoGrainSize(task->protocol),
+             devWork->cbd.chunkGrainsMid * ncclProtoGrainSize(task->protocol),
+             devWork->cbd.chunkGrainsHi * ncclProtoGrainSize(task->protocol));
+      }
+
       if (task->isCollnet) {
         TRACE(NCCL_COLL,
               "Collective %s(%s, %s, %s, %s) count=%ld devFuncId=%d channel{Lo..Hi}={%d..%d} count=%ld chunkCount=%d",
