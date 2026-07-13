@@ -659,9 +659,26 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
       break;
     }
     row += ncclNumDevRedOps * NumTypes * nAlgos * NCCL_NUM_PROTOCOLS;
+
+    if (coll == ncclFuncMixedPrecisionReduceScatter) {
+      break;
+    }
+    row += 1;
   } while (false);
 
   return ncclDevFuncRowToId[row];
+}
+
+inline ncclResult_t ncclDevFuncId_MixedPrecisionReduceScatter(int devRedOp, int outputAndAccumType, int inputType,
+                                                              int algo, int proto, int* funcId) {
+  if (devRedOp != ncclDevSum || outputAndAccumType != ncclFloat32 || inputType != ncclBfloat16 ||
+      algo != NCCL_ALGO_RING || proto != NCCL_PROTO_SIMPLE) {
+    return ncclInvalidArgument;
+  }
+  int id = ncclDevFuncId(ncclFuncMixedPrecisionReduceScatter, devRedOp, outputAndAccumType, algo, proto);
+  if (id < 0) return ncclInternalError;
+  *funcId = id;
+  return ncclSuccess;
 }
 
 inline int ncclDevFuncId_P2p() {

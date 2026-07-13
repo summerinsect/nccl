@@ -31,13 +31,15 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
 ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm);
 
 static inline size_t ncclFuncSendCount(ncclFunc_t func, int nRanks, size_t count) {
-  return func == ncclFuncReduceScatter ? nRanks * count : count;
+  return func == ncclFuncReduceScatter || func == ncclFuncMixedPrecisionReduceScatter ? nRanks * count : count;
 }
 static inline size_t ncclFuncRecvCount(ncclFunc_t func, int nRanks, size_t count) {
   return func == ncclFuncAllGather ? nRanks * count : count;
 }
 static inline size_t ncclFuncMaxSendRecvCount(ncclFunc_t func, int nRanks, size_t count) {
-  return func == ncclFuncAllGather || func == ncclFuncReduceScatter ? nRanks * count : count;
+  return func == ncclFuncAllGather || func == ncclFuncReduceScatter || func == ncclFuncMixedPrecisionReduceScatter ?
+           nRanks * count :
+           count;
 }
 
 ncclResult_t ncclGetCollNetSupport(struct ncclComm* comm, struct ncclTaskColl* task, int* collNetSupport);

@@ -286,11 +286,13 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   for (int a = 0; a < NCCL_NUM_ALGORITHMS; a++) hw[a] = nNodes == 1 ? intraHw[a] : NCCL_HW_NET;
 
   for (int coll = 0; coll < NCCL_NUM_FUNCTIONS; coll++) {
-    int nsteps = coll == ncclFuncAllReduce                                  ? 2 * (nRanks - 1) :
-                 coll == ncclFuncReduceScatter || coll == ncclFuncAllGather ? nRanks - 1 :
-                                                                              nRanks;
+    int nsteps = coll == ncclFuncAllReduce ? 2 * (nRanks - 1) :
+                 coll == ncclFuncReduceScatter || coll == ncclFuncAllGather ||
+                     coll == ncclFuncMixedPrecisionReduceScatter ? nRanks - 1 :
+                                                                   nRanks;
 
     for (int a = 0; a < NCCL_NUM_ALGORITHMS; a++) {
+      if (coll == ncclFuncMixedPrecisionReduceScatter && a != NCCL_ALGO_RING) continue;
       if ((coll == ncclFuncBroadcast || coll == ncclFuncReduce) && a != NCCL_ALGO_RING) continue;
       if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather) && a != NCCL_ALGO_PAT && a != NCCL_ALGO_RING &&
           a != NCCL_ALGO_NVLS && a != NCCL_ALGO_COLLNET_DIRECT)
@@ -298,6 +300,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
       if (coll == ncclFuncAllReduce && a == NCCL_ALGO_PAT) continue;
 
       for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
+        if (coll == ncclFuncMixedPrecisionReduceScatter && p != NCCL_PROTO_SIMPLE) continue;
         if ((a == NCCL_ALGO_NVLS || a == NCCL_ALGO_NVLS_TREE) && p != NCCL_PROTO_SIMPLE) continue;
         if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather) && a == NCCL_ALGO_PAT &&
             (p != NCCL_PROTO_SIMPLE || ncclPatEnable(comm) == 0))

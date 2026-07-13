@@ -38,6 +38,8 @@ struct ncclInfo {
   // WaitSignal descriptors
   int nDesc;
   ncclWaitSignalDesc_t* signalDescs;
+  // Only differs from datatype for mixed-precision collectives.
+  ncclDataType_t inputtype;
 };
 
 #endif

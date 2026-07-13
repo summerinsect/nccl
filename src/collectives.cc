@@ -29,6 +29,8 @@ const char* ncclFuncToString(ncclFunc_t fn) {
     return "Reduce";
   case ncclFuncReduceScatter:
     return "ReduceScatter";
+  case ncclFuncMixedPrecisionReduceScatter:
+    return "MixedPrecisionReduceScatter";
   case ncclFuncScatter:
     return "Scatter";
   case ncclFuncSendRecv:
@@ -252,6 +254,41 @@ ncclResult_t ncclReduceScatter(const void* sendbuff, void* recvbuff, size_t recv
                           stream, /* Args */
                           REDUCESCATTER_CHUNKSTEPS,
                           REDUCESCATTER_SLICESTEPS};
+  return ncclEnqueueCheck(&info);
+}
+
+NCCL_API(ncclResult_t, ncclMixedPrecisionReduceScatter, const void* sendbuff, void* recvbuff, size_t recvcount,
+         ncclDataType_t outputAndAccumType, ncclDataType_t inputType, ncclRedOp_t op, ncclComm* comm,
+         cudaStream_t stream);
+ncclResult_t ncclMixedPrecisionReduceScatter(const void* sendbuff, void* recvbuff, size_t recvcount,
+                                             ncclDataType_t outputAndAccumType, ncclDataType_t inputType,
+                                             ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  if (outputAndAccumType != ncclFloat32) {
+    WARN("MixedPrecisionReduceScatter : outputAndAccumType must be ncclFloat32");
+    return ncclInvalidArgument;
+  }
+  if (inputType != ncclBfloat16) {
+    WARN("MixedPrecisionReduceScatter : inputType must be ncclBfloat16");
+    return ncclInvalidArgument;
+  }
+  if (op != ncclSum) {
+    WARN("MixedPrecisionReduceScatter : only ncclSum is supported");
+    return ncclInvalidArgument;
+  }
+
+  struct ncclInfo info = {ncclFuncMixedPrecisionReduceScatter,
+                          "MixedPrecisionReduceScatter",
+                          sendbuff,
+                          recvbuff,
+                          recvcount,
+                          outputAndAccumType,
+                          op,
+                          0,
+                          comm,
+                          stream, /* Args */
+                          REDUCESCATTER_CHUNKSTEPS,
+                          REDUCESCATTER_SLICESTEPS};
+  info.inputtype = inputType;
   return ncclEnqueueCheck(&info);
 }
 

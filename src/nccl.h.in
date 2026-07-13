@@ -517,6 +517,24 @@ ncclResult_t pncclReduceScatter(const void* sendbuff, void* recvbuff,
     cudaStream_t stream);
 
 /*
+ * Mixed-Precision Reduce-Scatter
+ *
+ * Reduces bfloat16 input data using fp32 accumulation and leaves fp32 reduced
+ * result scattered over devices. This experimental API currently supports only:
+ * outputAndAccumType = ncclFloat32, inputType = ncclBfloat16, op = ncclSum.
+ *
+ * sendbuff should have at least nranks*recvcount bfloat16 elements.
+ * recvbuff should have at least recvcount float32 elements.
+ * In-place operation is not supported.
+ */
+ncclResult_t  ncclMixedPrecisionReduceScatter(const void* sendbuff, void* recvbuff,
+    size_t recvcount, ncclDataType_t outputAndAccumType, ncclDataType_t inputType,
+    ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
+ncclResult_t pncclMixedPrecisionReduceScatter(const void* sendbuff, void* recvbuff,
+    size_t recvcount, ncclDataType_t outputAndAccumType, ncclDataType_t inputType,
+    ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
+
+/*
  * All-Gather
  *
  * Each device gathers sendcount values from other GPUs into recvbuff,

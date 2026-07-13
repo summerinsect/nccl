@@ -69,24 +69,25 @@ enum {
 typedef ncclResult_t (*ncclProfilerCallback_t)(void** eHandle, int type, void* pHandle, int64_t pluginId,
                                                void* extData);
 
-#define NCCL_NUM_FUNCTIONS 5 // Send/Recv not included for now
+#define NCCL_NUM_FUNCTIONS 6 // Send/Recv not included for now
 typedef enum {
   ncclFuncBroadcast = 0,
   ncclFuncReduce = 1,
   ncclFuncAllGather = 2,
   ncclFuncReduceScatter = 3,
   ncclFuncAllReduce = 4,
-  ncclFuncSendRecv = 5,
-  ncclFuncSend = 6,
-  ncclFuncRecv = 7,
-  ncclFuncAlltoAll = 8,
-  ncclFuncScatter = 9,
-  ncclFuncGather = 10,
-  ncclFuncAllGatherV = 11,
-  ncclFuncPutSignal = 12,
-  ncclFuncSignal = 13,
-  ncclFuncWaitSignal = 14,
-  ncclNumFuncs = 15
+  ncclFuncMixedPrecisionReduceScatter = 5,
+  ncclFuncSendRecv = 6,
+  ncclFuncSend = 7,
+  ncclFuncRecv = 8,
+  ncclFuncAlltoAll = 9,
+  ncclFuncScatter = 10,
+  ncclFuncGather = 11,
+  ncclFuncAllGatherV = 12,
+  ncclFuncPutSignal = 13,
+  ncclFuncSignal = 14,
+  ncclFuncWaitSignal = 15,
+  ncclNumFuncs = 16
 } ncclFunc_t;
 
 #endif

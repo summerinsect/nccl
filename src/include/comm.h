@@ -198,6 +198,7 @@ struct ncclTaskColl {
   size_t count;
   int root;
   ncclDataType_t datatype;
+  ncclDataType_t inputtype;
   ncclRedOp_t opHost;
   struct ncclDevRedOpFull opDev;
   int chunkSteps, sliceSteps;
