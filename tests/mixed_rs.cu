@@ -8,12 +8,12 @@
 #include <nccl.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+#include <string>
 #include <vector>
 
 #define CUDACHECK(cmd)                                                                               \
@@ -68,6 +68,15 @@ struct ErrorStats {
   size_t index = 0;
 };
 
+struct TimingStats {
+  double avgMs = 0.0;
+  double p50Ms = 0.0;
+  double p90Ms = 0.0;
+  double p99Ms = 0.0;
+  double logicalFullGBps = 0.0;
+  double ringBusEstGBps = 0.0;
+};
+
 static size_t parseSize(const char* s) {
   char* end = nullptr;
   unsigned long long value = std::strtoull(s, &end, 0);
@@ -91,6 +100,17 @@ enum class Path {
   NativeBf16,
 };
 
+static const char* pathName(Path path, bool forcedRingSimple) {
+  if (path == Path::GoldF32) return forcedRingSimple ? "fp32_ring_simple" : "fp32_default";
+  if (path == Path::Mixed) return "mixed_ring_simple";
+  return forcedRingSimple ? "bf16_ring_simple" : "bf16_default";
+}
+
+static size_t logicalFullBytes(Path path, int nranks, size_t recvcount) {
+  size_t dtypeSize = path == Path::NativeBf16 ? sizeof(__nv_bfloat16) : sizeof(float);
+  return static_cast<size_t>(nranks) * recvcount * dtypeSize;
+}
+
 static void runCollective(Path path, const std::vector<int>& devices, const std::vector<ncclComm_t>& comms,
                           std::vector<RankBuffers>& bufs, size_t recvcount) {
   NCCLCHECK(ncclGroupStart());
@@ -110,17 +130,70 @@ static void runCollective(Path path, const std::vector<int>& devices, const std:
   NCCLCHECK(ncclGroupEnd());
 }
 
-static double timeCollective(Path path, const std::vector<int>& devices, const std::vector<ncclComm_t>& comms,
-                             std::vector<RankBuffers>& bufs, size_t recvcount, int iters) {
-  constexpr int warmup = 5;
+static double percentile(std::vector<double> sorted, double q) {
+  if (sorted.empty()) return 0.0;
+  size_t idx = static_cast<size_t>(std::ceil(q * sorted.size())) - 1;
+  idx = std::min(idx, sorted.size() - 1);
+  return sorted[idx];
+}
+
+static TimingStats timeCollective(Path path, const std::vector<int>& devices, const std::vector<ncclComm_t>& comms,
+                                  std::vector<RankBuffers>& bufs, size_t recvcount, int warmup, int iters) {
+  std::vector<cudaEvent_t> starts(bufs.size());
+  std::vector<cudaEvent_t> stops(bufs.size());
+  for (size_t r = 0; r < bufs.size(); ++r) {
+    CUDACHECK(cudaSetDevice(devices[r]));
+    CUDACHECK(cudaEventCreate(&starts[r]));
+    CUDACHECK(cudaEventCreate(&stops[r]));
+  }
+
   for (int i = 0; i < warmup; ++i) runCollective(path, devices, comms, bufs, recvcount);
   syncAll(devices, bufs);
 
-  auto begin = std::chrono::steady_clock::now();
-  for (int i = 0; i < iters; ++i) runCollective(path, devices, comms, bufs, recvcount);
-  syncAll(devices, bufs);
-  auto end = std::chrono::steady_clock::now();
-  return std::chrono::duration<double, std::milli>(end - begin).count() / static_cast<double>(iters);
+  std::vector<double> samples;
+  samples.reserve(iters);
+  for (int i = 0; i < iters; ++i) {
+    for (size_t r = 0; r < bufs.size(); ++r) {
+      CUDACHECK(cudaSetDevice(devices[r]));
+      CUDACHECK(cudaEventRecord(starts[r], bufs[r].stream));
+    }
+    runCollective(path, devices, comms, bufs, recvcount);
+    for (size_t r = 0; r < bufs.size(); ++r) {
+      CUDACHECK(cudaSetDevice(devices[r]));
+      CUDACHECK(cudaEventRecord(stops[r], bufs[r].stream));
+    }
+
+    double maxMs = 0.0;
+    for (size_t r = 0; r < bufs.size(); ++r) {
+      CUDACHECK(cudaSetDevice(devices[r]));
+      CUDACHECK(cudaEventSynchronize(stops[r]));
+      float ms = 0.0f;
+      CUDACHECK(cudaEventElapsedTime(&ms, starts[r], stops[r]));
+      maxMs = std::max(maxMs, static_cast<double>(ms));
+    }
+    samples.push_back(maxMs);
+  }
+
+  for (size_t r = 0; r < bufs.size(); ++r) {
+    CUDACHECK(cudaSetDevice(devices[r]));
+    CUDACHECK(cudaEventDestroy(starts[r]));
+    CUDACHECK(cudaEventDestroy(stops[r]));
+  }
+
+  std::vector<double> sorted = samples;
+  std::sort(sorted.begin(), sorted.end());
+
+  TimingStats stats;
+  stats.avgMs = std::accumulate(samples.begin(), samples.end(), 0.0) / static_cast<double>(samples.size());
+  stats.p50Ms = percentile(sorted, 0.50);
+  stats.p90Ms = percentile(sorted, 0.90);
+  stats.p99Ms = percentile(sorted, 0.99);
+
+  double fullBytes = static_cast<double>(logicalFullBytes(path, static_cast<int>(bufs.size()), recvcount));
+  double busBytes = fullBytes * static_cast<double>(bufs.size() - 1) / static_cast<double>(bufs.size());
+  stats.logicalFullGBps = fullBytes / stats.avgMs / 1.0e6;
+  stats.ringBusEstGBps = busBytes / stats.avgMs / 1.0e6;
+  return stats;
 }
 
 static ErrorStats compareToGold(const std::vector<int>& devices, const std::vector<RankBuffers>& bufs,
@@ -179,17 +252,30 @@ int main(int argc, char** argv) {
   int nranks = argc > 1 ? static_cast<int>(parseSize(argv[1])) : deviceCount;
   size_t recvcount = argc > 2 ? parseSize(argv[2]) : (1ull << 20);
   int iters = argc > 3 ? static_cast<int>(parseSize(argv[3])) : 20;
+  std::string mode = argc > 4 ? argv[4] : "forced";
+  int warmup = argc > 5 ? static_cast<int>(parseSize(argv[5])) : 10;
   if (nranks < 2 || nranks > deviceCount) {
-    std::fprintf(stderr, "Usage: %s [nranks<=%d] [recvcount] [iters]\n", argv[0], deviceCount);
+    std::fprintf(stderr, "Usage: %s [nranks<=%d] [recvcount] [iters] [forced|default] [warmup]\n", argv[0],
+                 deviceCount);
     return EXIT_FAILURE;
   }
-  if (iters <= 0 || recvcount == 0) {
-    std::fprintf(stderr, "recvcount and iters must be positive\n");
+  if (iters <= 0 || warmup < 0 || recvcount == 0) {
+    std::fprintf(stderr, "recvcount and iters must be positive; warmup must be non-negative\n");
+    return EXIT_FAILURE;
+  }
+  bool forcedRingSimple = mode == "forced";
+  if (!forcedRingSimple && mode != "default") {
+    std::fprintf(stderr, "mode must be 'forced' or 'default'\n");
     return EXIT_FAILURE;
   }
 
-  setenv("NCCL_ALGO", "Ring", 1);
-  setenv("NCCL_PROTO", "Simple", 1);
+  if (forcedRingSimple) {
+    setenv("NCCL_ALGO", "Ring", 1);
+    setenv("NCCL_PROTO", "Simple", 1);
+  } else {
+    unsetenv("NCCL_ALGO");
+    unsetenv("NCCL_PROTO");
+  }
 
   std::vector<int> devices(nranks);
   std::iota(devices.begin(), devices.end(), 0);
@@ -235,21 +321,27 @@ int main(int argc, char** argv) {
   ErrorStats bf16Err = compareToGold(devices, bufs, recvcount, false);
   if (std::getenv("MIXED_RS_DUMP") != nullptr) dumpSmall(devices, bufs, recvcount);
 
-  double goldMs = timeCollective(Path::GoldF32, devices, comms, bufs, recvcount, iters);
-  double mixedMs = timeCollective(Path::Mixed, devices, comms, bufs, recvcount, iters);
-  double bf16Ms = timeCollective(Path::NativeBf16, devices, comms, bufs, recvcount, iters);
+  TimingStats goldStats = timeCollective(Path::GoldF32, devices, comms, bufs, recvcount, warmup, iters);
+  TimingStats mixedStats = timeCollective(Path::Mixed, devices, comms, bufs, recvcount, warmup, iters);
+  TimingStats bf16Stats = timeCollective(Path::NativeBf16, devices, comms, bufs, recvcount, warmup, iters);
 
   double shardMiB = recvcount * sizeof(float) / (1024.0 * 1024.0);
   double fullBf16MiB = sendcount * sizeof(__nv_bfloat16) / (1024.0 * 1024.0);
   double fullF32MiB = sendcount * sizeof(float) / (1024.0 * 1024.0);
-  std::printf("nranks=%d recvcount=%zu shard_fp32=%.3f MiB full_bf16_send=%.3f MiB full_fp32_gold=%.3f MiB\n",
-              nranks, recvcount, shardMiB, fullBf16MiB, fullF32MiB);
+  std::printf("nranks=%d recvcount=%zu iters=%d warmup=%d mode=%s shard_fp32=%.3f MiB full_bf16_send=%.3f MiB "
+              "full_fp32_gold=%.3f MiB\n",
+              nranks, recvcount, iters, warmup, mode.c_str(), shardMiB, fullBf16MiB, fullF32MiB);
   std::printf("mixed_vs_gold: max_abs=%.9g max_rel=%.9g at rank=%d index=%zu\n", mixedErr.maxAbs, mixedErr.maxRel,
               mixedErr.rank, mixedErr.index);
   std::printf("bf16_vs_gold:  max_abs=%.9g max_rel=%.9g at rank=%d index=%zu\n", bf16Err.maxAbs, bf16Err.maxRel,
               bf16Err.rank, bf16Err.index);
-  std::printf("avg_ms fp32_gold_ring_simple=%.3f mixed_ring_simple=%.3f native_bf16_ring_simple=%.3f\n", goldMs,
-              mixedMs, bf16Ms);
+  std::printf("perf path avg_ms p50_ms p90_ms p99_ms logical_full_GBps ring_bus_est_GBps\n");
+  for (auto item : {std::make_pair(Path::GoldF32, goldStats), std::make_pair(Path::Mixed, mixedStats),
+                    std::make_pair(Path::NativeBf16, bf16Stats)}) {
+    std::printf("perf %s %.3f %.3f %.3f %.3f %.2f %.2f\n", pathName(item.first, forcedRingSimple), item.second.avgMs,
+                item.second.p50Ms, item.second.p90Ms, item.second.p99Ms, item.second.logicalFullGBps,
+                item.second.ringBusEstGBps);
+  }
 
   for (int r = 0; r < nranks; ++r) {
     CUDACHECK(cudaSetDevice(devices[r]));
