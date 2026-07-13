@@ -20,6 +20,7 @@ static uint8_t ncclStringToFunc(const char* func) {
   if (0 == strcmp(func, "Recv")) return ncclFuncRecv;
   if (0 == strcmp(func, "Reduce")) return ncclFuncReduce;
   if (0 == strcmp(func, "ReduceScatter")) return ncclFuncReduceScatter;
+  if (0 == strcmp(func, "MixedPrecisionReduceScatter")) return ncclFuncMixedPrecisionReduceScatter;
   if (0 == strcmp(func, "SendRecv")) return ncclFuncSendRecv;
   return ncclFuncSend;
 }

@@ -10,7 +10,7 @@ import sys
 import shutil
 
 # Order of redops, tys, protos, algos must match src/include/device.h
-all_colls =  ["Broadcast","Reduce","AllGather","AllGatherV", "ReduceScatter","AllReduce","SendRecv"]
+all_colls =  ["Broadcast","Reduce","AllGather","AllGatherV", "ReduceScatter","AllReduce","MixedPrecisionReduceScatter","SendRecv"]
 all_redops = ["Sum","Prod","MinMax","PreMulSum","SumPostDiv"]
 all_tys =    ["i8","u8","i32","u32","i64","u64","f16","f32","f64","bf16","f8e4m3","f8e5m2"]
 all_protos = ["LL","LL128","SIMPLE"]
@@ -88,6 +88,7 @@ algos_of_coll = {
   "Broadcast":     ["RING"],
   "Reduce":        ["RING"],
   "ReduceScatter": ["RING","COLLNET_DIRECT","NVLS","PAT"],
+  "MixedPrecisionReduceScatter": ["RING"],
   "SendRecv":      [None]
 }
 
@@ -98,6 +99,7 @@ coll_camel_to_lower = {
   "Broadcast":     "broadcast",
   "Reduce":        "reduce",
   "ReduceScatter": "reduce_scatter",
+  "MixedPrecisionReduceScatter": "mixed_precision_reduce_scatter",
   "SendRecv":      "sendrecv"
 }
 coll_lower_to_camel = {coll_camel_to_lower[x]: x for x in coll_camel_to_lower}
@@ -113,6 +115,10 @@ def required_cuda(coll, redop, ty, algo, proto):
   if coll in ("SendRecv", "Generic", "Nop"): return (cudart, arch)
 
   if proto!="SIMPLE" and algo not in ("RING","TREE"): return None
+
+  if coll == "MixedPrecisionReduceScatter":
+    if redop != "Sum" or ty != "f32" or algo != "RING" or proto != "SIMPLE": return None
+    return (max(cudart, 11000), arch)
 
   if coll in ("AllReduce","Reduce","ReduceScatter"):
     if redop=="SumPostDiv" and ty[0] not in ("i","u"): return None
@@ -153,6 +159,7 @@ def best_kernel(coll, redop, ty, algo, proto):
     # Modify this logic to control how many kernels are specialized.
     if coll=="Nop": return ("Generic", None, None, None, None)
     if coll=="SendRecv": return ("SendRecv", None, None, None, None)
+    if coll=="MixedPrecisionReduceScatter": return (coll, redop, ty, algo, proto)
     if coll in ("AllGather","Broadcast","AllGatherV"): return (coll, None, None, "RING", "LL")
     return (coll, "Sum", ty, ("TREE" if algo=="TREE" else "RING"), "LL")
   # Need to ensure kernel is specialize for a primary function
@@ -176,6 +183,7 @@ def enumerate_func_rows():
         for algo in algos:
           for proto in all_protos:
             yield (coll, redop, ty, algo, proto)
+  yield ("MixedPrecisionReduceScatter", "Sum", "f32", "RING", "SIMPLE")
 
 ################################################################################
 

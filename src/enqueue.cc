@@ -95,6 +95,7 @@ static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
   case ncclFuncAllGather:
     return nRanks;
   case ncclFuncReduceScatter:
+  case ncclFuncMixedPrecisionReduceScatter:
     return nRanks;
   default:
     return 1;
@@ -377,6 +378,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       t->count = bcastTask->count;
       t->root = bcastTask->root;
       t->datatype = bcastTask->datatype;
+      t->inputtype = bcastTask->datatype;
       t->trafficBytes = t->count * ncclFuncTrafficPerByte(t->func, comm->nRanks);
       t->chunkSteps = BROADCAST_CHUNKSTEPS;
       t->sliceSteps = BROADCAST_SLICESTEPS;
@@ -422,8 +424,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
     struct ncclTaskColl* aggBeg = tasksByFnOpTy[fnOpTyIndices[cursor]];
     int collNetSupport = 0;
     NCCLCHECK(ncclGetCollNetSupport(comm, aggBeg, &collNetSupport));
-    int nvlsSupport =
-      comm->nvlsSupport && (ncclNvlsSupported(aggBeg->opDev.op, aggBeg->datatype) || aggBeg->func == ncclFuncAllGather);
+    int nvlsSupport = aggBeg->func != ncclFuncMixedPrecisionReduceScatter && comm->nvlsSupport &&
+                      (ncclNvlsSupported(aggBeg->opDev.op, aggBeg->datatype) ||
+                       aggBeg->func == ncclFuncAllGather);
     // Crudely estimate number of tasks per channel. This is using the wrong number
     // of channels for NVLS algos, but knowing the algo requires having this value,
     // so either be crude our iterate until fixed point, we chose the former.
@@ -439,7 +442,14 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       }
 
       NCCLCHECK(ncclGetAlgoInfo(comm, &agg, collNetSupport, nvlsSupport, nTasksPerChannel, simInfo));
-      agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
+      if (agg.func == ncclFuncMixedPrecisionReduceScatter) {
+        int devFuncId;
+        NCCLCHECK(ncclDevFuncId_MixedPrecisionReduceScatter(agg.opDev.op, agg.datatype, agg.inputtype, agg.algorithm,
+                                                            agg.protocol, &devFuncId));
+        agg.devFuncId = devFuncId;
+      } else {
+        agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
+      }
 
       int isCollnet = 0, isNvls = 0;
       switch (agg.algorithm) {
@@ -1965,6 +1975,9 @@ ncclResult_t ncclGetCollNetSupport(struct ncclComm* comm, struct ncclTaskColl* i
   }
   *collNetSupport = comm->config.collnetEnable;
   switch (info->func) {
+  case ncclFuncMixedPrecisionReduceScatter:
+    *collNetSupport = 0;
+    break;
   case ncclFuncAllReduce:
   case ncclFuncReduce:
   case ncclFuncReduceScatter:
@@ -1992,6 +2005,12 @@ static ncclResult_t updateCollCostTable(struct ncclComm* comm, struct ncclTaskCo
 
   if (comm->nRanks == 1) {
     table[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE] = 0.0;
+    return ncclSuccess;
+  }
+
+  if (info->func == ncclFuncMixedPrecisionReduceScatter) {
+    NCCLCHECK(ncclTopoGetAlgoTime(comm, info->func, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE, nBytes, numPipeOps,
+                                  &table[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE]));
     return ncclSuccess;
   }
 
@@ -2137,6 +2156,11 @@ ncclResult_t ncclGetAlgoInfo(struct ncclComm* comm, struct ncclTaskColl* info, i
   float collCostTable[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
   initCollCostTable((float**)collCostTable);
   NCCLCHECK(updateCollCostTable(comm, info, nBytes, collNetSupport, nvlsSupport, numPipeOps, (float**)collCostTable));
+  if (info->func == ncclFuncMixedPrecisionReduceScatter) {
+    NCCLCHECK(topoGetAlgoInfo(comm, info, nBytes, (float**)collCostTable, simInfo));
+    info->nMaxChannels = nMaxChannels == 0 ? info->nMaxChannels : nMaxChannels;
+    return ncclSuccess;
+  }
   if (comm->tuner != NULL) {
     NCCLCHECK(ncclRegFind(comm, info->sendbuff, sendbuffSize, &regSendBuf));
     NCCLCHECK(ncclRegFind(comm, info->recvbuff, recvbuffSize, &regRecvBuf));
@@ -2197,6 +2221,9 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
               info->algorithm == NCCL_ALGO_NVLS           ? ncclPatternNvls :
               info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
                                                             ncclPatternRing;
+    break;
+  case ncclFuncMixedPrecisionReduceScatter:
+    pattern = ncclPatternRing;
     break;
   case ncclFuncAllGather:
     pattern = info->algorithm == NCCL_ALGO_PAT            ? ncclPatternPatDown :
@@ -2729,6 +2756,7 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
     t->count = info->count;
     t->root = info->root;
     t->datatype = info->datatype;
+    t->inputtype = info->inputtype;
     size_t elementSize = ncclTypeSize(t->datatype);
     if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast) {
       t->count *= elementSize;
@@ -2781,6 +2809,7 @@ static ncclResult_t ceCollTaskAppend(struct ncclComm* comm, struct ncclInfo* inf
   t->count = info->count;
   t->root = info->root;
   t->datatype = info->datatype;
+  t->inputtype = info->inputtype;
   size_t elementSize = ncclTypeSize(t->datatype);
   if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast) {
     t->count *= elementSize;
@@ -3047,8 +3076,10 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       // Append CE collective task if CE is supported and requested by user
       ncclSymRegType_t winRegType;
       NCCLCHECK(ncclGetSymRegType(sendWin, recvWin, &winRegType));
-      bool ceAvailable = ncclCeAvailable(comm, info->coll, info->op, info->datatype, winRegType);
-      bool hierCeAvailable = ncclHierCeAvailable(comm, info->coll, info->op, info->datatype, winRegType);
+      bool ceAvailable = info->coll != ncclFuncMixedPrecisionReduceScatter &&
+                         ncclCeAvailable(comm, info->coll, info->op, info->datatype, winRegType);
+      bool hierCeAvailable = info->coll != ncclFuncMixedPrecisionReduceScatter &&
+                             ncclHierCeAvailable(comm, info->coll, info->op, info->datatype, winRegType);
       bool hasSysmemSegment = ncclDevrWindowHasSysmemSegment(sendWin) || ncclDevrWindowHasSysmemSegment(recvWin);
 
       if ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) && (ceAvailable || hierCeAvailable) && !hasSysmemSegment) {
@@ -3122,6 +3153,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
 }
 
 ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
+  if (info->coll != ncclFuncMixedPrecisionReduceScatter) info->inputtype = info->datatype;
   // Early-out on invalid or revoked communicator
   ncclResult_t ret = CommCheck(info->comm, info->opName, "comm");
   if (ret != ncclSuccess) return ncclGroupErrCheck(ret);

@@ -190,7 +190,8 @@ fail:
 ncclResult_t ncclArgsGlobalCheck(struct ncclArgsInfo* argsInfo) {
   struct ncclInfo* info = &argsInfo->info;
   if (info->coll != ncclFuncSend && info->coll != ncclFuncRecv && info->coll != ncclFuncPutSignal &&
-      info->coll != ncclFuncSignal && info->coll != ncclFuncWaitSignal) {
+      info->coll != ncclFuncSignal && info->coll != ncclFuncWaitSignal &&
+      info->coll != ncclFuncMixedPrecisionReduceScatter) {
     // exclude one-sided and sendrecv operations
     // Check registration globally
     NCCLCHECK(registrationCheck(info));
@@ -208,6 +209,10 @@ ncclResult_t ArgsCheck(struct ncclInfo* info) {
     WARN("%s : invalid type %d", info->opName, info->datatype);
     return ncclInvalidArgument;
   }
+  if (info->inputtype < 0 || info->inputtype >= ncclNumTypes) {
+    WARN("%s : invalid input type %d", info->opName, info->inputtype);
+    return ncclInvalidArgument;
+  }
 
   // ncclMaxRedOp < info->op will always be false due to the sizes of
   // the datatypes involved, and that's by design.  We keep the check though
@@ -222,6 +227,23 @@ ncclResult_t ArgsCheck(struct ncclInfo* info) {
       (info->comm->userRedOpCapacity <= opIx || info->comm->userRedOps[opIx].freeNext != -1)) {
     WARN("%s : reduction operation %d unknown to this communicator", info->opName, info->op);
     return ncclInvalidArgument;
+  }
+
+  if (info->coll == ncclFuncMixedPrecisionReduceScatter) {
+    if (info->datatype != ncclFloat32 || info->inputtype != ncclBfloat16 || info->op != ncclSum) {
+      WARN("%s : only bf16 input, fp32 output/accumulation, and ncclSum are supported", info->opName);
+      return ncclInvalidArgument;
+    }
+    if (info->comm->nRanks == 1) {
+      WARN("%s : single-rank mixed ReduceScatter is not supported in this PoC", info->opName);
+      return ncclInvalidUsage;
+    }
+    const char* inPlace =
+      (const char*)info->sendbuff + info->comm->rank * info->count * ncclTypeSize(info->inputtype);
+    if (info->sendbuff == info->recvbuff || (void*)inPlace == info->recvbuff) {
+      WARN("%s : in-place operation is not supported", info->opName);
+      return ncclInvalidArgument;
+    }
   }
 
   if (info->comm->checkMode != ncclCheckModeDefault) {
