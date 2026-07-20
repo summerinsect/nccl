@@ -16,44 +16,81 @@
 
 namespace {
 
-template <typename RedOp>
-__device__ __forceinline__ void mixedReduceCopy(int tid, int nworkers, void* src0, void* src1, void* dst, int nelem,
-                                                bool hasPeerSrc) {
-  constexpr int EltPerPack = 8;
+template <int Recv, int Unroll>
+__device__ __forceinline__ void mixedReduceCopy(int tid, int nworkers, void* src0, void* src1, void* dst, int nelem) {
+  // Use the fp32 wire/output width as the unit of work. Four bf16 values occupy
+  // eight input bytes and expand to one 16-byte fp32 pack. Keeping Unroll fp32
+  // packs live matches the native reduceCopy pipeline without doubling its
+  // accumulator register footprint.
+  constexpr int EltPerPack = 4;
+  constexpr int EltPerHunk = Unroll * WARP_SIZE * EltPerPack;
   __nv_bfloat16 const* local = static_cast<__nv_bfloat16 const*>(src0);
   float const* peer = static_cast<float const*>(src1);
   float* out = static_cast<float*>(dst);
 
   uintptr_t localAddr = cvta_to_global(local);
-  uintptr_t peerAddr = hasPeerSrc ? cvta_to_global(peer) : 0;
+  uintptr_t peerAddr = Recv ? cvta_to_global(peer) : 0;
   uintptr_t outAddr = cvta_to_global(out);
-  bool aligned = ((localAddr | peerAddr | outAddr) & 0xf) == 0;
+  bool aligned = (localAddr & 0x7) == 0 && ((peerAddr | outAddr) & 0xf) == 0;
   int packedElem = aligned ? nelem / EltPerPack * EltPerPack : 0;
+  int fullHunkElem = packedElem / EltPerHunk * EltPerHunk;
+  int nwarps = nworkers / WARP_SIZE;
+  int warp = tid / WARP_SIZE;
+  int lane = tid % WARP_SIZE;
 
-  for (int i = tid * EltPerPack; i < packedElem; i += nworkers * EltPerPack) {
-    BytePack<16> localPack = ld_volatile_global<16>(localAddr + i * sizeof(__nv_bfloat16));
-    BytePack<16> acc[2];
+  // Assign one contiguous hunk to each warp and keep multiple independent
+  // loads in flight per thread, as native NCCL reduceCopyPacks does.
+  for (int hunk = warp * EltPerHunk; hunk < fullHunkElem; hunk += nwarps * EltPerHunk) {
+    BytePack<16> acc[Unroll];
 
-    NVCC_PRAGMA_UNROLL(EltPerPack)
-    for (int j = 0; j < EltPerPack; j++) acc[j / 4].u32[j % 4] = uint32_t(localPack.u16[j]) << 16;
-
-    if (hasPeerSrc) {
-      BytePack<16> peerPack[2] = {ld_volatile_global<16>(peerAddr + i * sizeof(float)),
-                                  ld_volatile_global<16>(peerAddr + (i + 4) * sizeof(float))};
+    NVCC_PRAGMA_UNROLL(Unroll)
+    for (int u = 0; u < Unroll; u++) {
+      int i = hunk + (u * WARP_SIZE + lane) * EltPerPack;
+      BytePack<8> localPack = ld_volatile_global<8>(localAddr + i * sizeof(__nv_bfloat16));
       NVCC_PRAGMA_UNROLL(EltPerPack)
-      for (int j = 0; j < EltPerPack; j++) {
-        float sum = __uint_as_float(acc[j / 4].u32[j % 4]) + __uint_as_float(peerPack[j / 4].u32[j % 4]);
-        acc[j / 4].u32[j % 4] = __float_as_uint(sum);
+      for (int j = 0; j < EltPerPack; j++) acc[u].u32[j] = uint32_t(localPack.u16[j]) << 16;
+    }
+
+    if (Recv) {
+      NVCC_PRAGMA_UNROLL(Unroll)
+      for (int u = 0; u < Unroll; u++) {
+        int i = hunk + (u * WARP_SIZE + lane) * EltPerPack;
+        BytePack<16> peerPack = ld_volatile_global<16>(peerAddr + i * sizeof(float));
+        NVCC_PRAGMA_UNROLL(EltPerPack)
+        for (int j = 0; j < EltPerPack; j++) {
+          float sum = __uint_as_float(acc[u].u32[j]) + __uint_as_float(peerPack.u32[j]);
+          acc[u].u32[j] = __float_as_uint(sum);
+        }
       }
     }
 
-    st_global<16>(outAddr + i * sizeof(float), acc[0]);
-    st_global<16>(outAddr + (i + 4) * sizeof(float), acc[1]);
+    NVCC_PRAGMA_UNROLL(Unroll)
+    for (int u = 0; u < Unroll; u++) {
+      int i = hunk + (u * WARP_SIZE + lane) * EltPerPack;
+      st_global<16>(outAddr + i * sizeof(float), acc[u]);
+    }
+  }
+
+  // Handle complete packs left after the last full warp hunk.
+  for (int i = fullHunkElem + tid * EltPerPack; i < packedElem; i += nworkers * EltPerPack) {
+    BytePack<8> localPack = ld_volatile_global<8>(localAddr + i * sizeof(__nv_bfloat16));
+    BytePack<16> acc;
+    NVCC_PRAGMA_UNROLL(EltPerPack)
+    for (int j = 0; j < EltPerPack; j++) acc.u32[j] = uint32_t(localPack.u16[j]) << 16;
+    if (Recv) {
+      BytePack<16> peerPack = ld_volatile_global<16>(peerAddr + i * sizeof(float));
+      NVCC_PRAGMA_UNROLL(EltPerPack)
+      for (int j = 0; j < EltPerPack; j++) {
+        float sum = __uint_as_float(acc.u32[j]) + __uint_as_float(peerPack.u32[j]);
+        acc.u32[j] = __float_as_uint(sum);
+      }
+    }
+    st_global<16>(outAddr + i * sizeof(float), acc);
   }
 
   for (int i = packedElem + tid; i < nelem; i += nworkers) {
     float acc = __bfloat162float(local[i]);
-    if (hasPeerSrc) acc += ((volatile float const*)peer)[i];
+    if (Recv) acc += ((volatile float const*)peer)[i];
     out[i] = acc;
   }
 }
@@ -128,8 +165,8 @@ class MixedPrecisionReduceScatterPrims {
 
         int workSize = ncclShmem.aborted ? 0 : sliceSize;
         if (workSize > 0) {
-          mixedReduceCopy<RedOp>(tid, nworkers, ncclShmem.groups[0].srcs[0], ncclShmem.groups[0].srcs[1],
-                                 ncclShmem.groups[0].dsts[0], workSize, Recv != 0);
+          mixedReduceCopy<Recv, ncclCollUnroll()>(tid, nworkers, ncclShmem.groups[0].srcs[0],
+                                                 ncclShmem.groups[0].srcs[1], ncclShmem.groups[0].dsts[0], workSize);
         }
 
         barrier();
